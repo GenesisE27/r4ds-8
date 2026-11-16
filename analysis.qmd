@@ -11,3 +11,124 @@ library(tidyverse)
 library(arrow)
 ```
 
+
+```{r}
+#| cache: true
+markets <- read_parquet("data/markets.parquet")
+
+joined <- open_dataset("data/history.parquet") |>
+  collect() |>
+  left_join(markets, by = "market_id") |>
+  mutate(
+    outcome_numeric    = if_else(outcome == "YES", 1, 0),
+    prediction_error   = abs(probability - outcome_numeric),
+    days_to_resolution = as.numeric(as.Date(ymd_hms(resolved_at)) - date),
+    horizon = case_when(
+      days_to_resolution > 90 ~ "More than 90 days",
+      days_to_resolution >= 30 ~ "30 to 90 days",
+      days_to_resolution >= 7 ~ "7 to 30 days",
+      days_to_resolution >= 1 ~ "1 to 7 days",
+      days_to_resolution == 0 ~ "Final day"
+    ),
+    horizon = factor(
+      horizon,
+      levels = c(
+        "More than 90 days",
+        "30 to 90 days",
+        "7 to 30 days",
+        "1 to 7 days",
+        "Final day"
+      )
+    )
+  )
+
+groups        <- read_parquet("data/groups.parquet")
+market_groups <- read_parquet("data/market_groups.parquet")
+```
+
+```{r}
+accuracy <- joined |>
+  group_by(time_bucket = horizon) |>
+  summarise(
+    mean_prediction_error = mean(prediction_error, na.rm = TRUE),
+    snapshots = n(),
+    .groups = "drop"
+  )
+
+print(accuracy)
+
+ggplot(
+  accuracy,
+  aes(x = time_bucket, y = mean_prediction_error, group = 1)
+) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Prediction markets get smarter near the deadline",
+    subtitle = "Mean absolute error in Manifold Markets forecasts, by days remaining",
+    x = "Days remaining",
+    y = "Mean absolute error"
+  )
+```
+
+```{r}
+joined |>
+  filter(days_to_resolution == 0) |>
+  ggplot(aes(x = probability)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, color = "white") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(
+    x = "Final-day forecast probability",
+    y = "Number of snapshots"
+  )
+```
+
+```{r}
+calibration <- joined |>
+  filter(days_to_resolution == 0) |>
+  mutate(
+    probability_bin = cut(
+      probability,
+      breaks = seq(0, 1, by = 0.1),
+      labels = paste0(seq(0, 90, by = 10), "-", seq(10, 100, by = 10), "%"),
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  ) |>
+  group_by(probability_bin) |>
+  summarise(
+    actual_rate = mean(outcome_numeric, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(calibration)
+
+ggplot(
+  calibration,
+  aes(
+    x = (as.integer(probability_bin) - 0.5) / 10,
+    y = actual_rate,
+    size = n
+  )
+) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_point() +
+  scale_x_continuous(
+    breaks = seq(0, 1, by = 0.1),
+    labels = scales::label_percent(),
+    limits = c(0, 1)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 1, by = 0.1),
+    labels = scales::label_percent(),
+    limits = c(0, 1)
+  ) +
+  scale_size_continuous(name = "Markets in bin") +
+  coord_equal() +
+  labs(
+    title = "Observed YES rates generally increase with predicted probability",
+    x = "Predicted probability",
+    y = "Actual resolution rate"
+  )
+```
